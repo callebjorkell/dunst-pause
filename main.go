@@ -2,13 +2,14 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	notification "github.com/TheCreeper/go-notify"
 	"github.com/rjeczalik/notify"
 	log "github.com/sirupsen/logrus"
-	"io"
 	"os"
 	"os/user"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,102 @@ const (
 	Pause  = "DUNST_COMMAND_PAUSE"
 	Resume = "DUNST_COMMAND_RESUME"
 )
+
+var PauseResolution = 10 * time.Second
+
+type Status int
+
+const (
+	Paused Status = iota
+	Active
+	Initial
+)
+
+type state struct {
+	State  Status
+	Until  time.Time
+	mu     *sync.RWMutex
+	closer chan struct{}
+}
+
+func (s *state) Pause(expiry time.Duration) {
+	s.mu.Lock()
+
+	defer s.Status()
+	if s.State != Paused {
+		s.State = Paused
+		go pauseNotifications()
+	}
+
+	if s.closer != nil {
+		// close any old timer/ticker running
+		close(s.closer)
+	}
+
+	s.closer = make(chan struct{})
+	s.Until = time.Now().Add(expiry)
+	go s.handleTick(s.closer)
+	go s.handleTimeout(s.closer, expiry)
+
+	s.mu.Unlock()
+}
+
+func (s *state) Activate() {
+	s.mu.Lock()
+	if s.State != Active {
+		defer s.Status()
+		go resumeNotifications(s.State == Initial)
+		s.State = Active
+	}
+
+	if s.closer != nil {
+		close(s.closer)
+		s.closer = nil
+	}
+
+	s.mu.Unlock()
+}
+
+func (s *state) handleTick(c <-chan struct{}) {
+	defer log.Debug("Ticker handler exited.")
+	t := time.NewTicker(PauseResolution)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			s.Status()
+		case <-c:
+			return
+		}
+	}
+}
+
+func (s *state) handleTimeout(c <-chan struct{}, after time.Duration) {
+	defer log.Debug("Timeout handler exited.")
+	t := time.NewTimer(after)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			s.Activate()
+		case <-c:
+			return
+		}
+	}
+}
+
+func (s *state) Status() {
+	s.mu.RLock()
+	switch s.State {
+	case Paused:
+		until := time.Until(s.Until)
+		m := (until / time.Minute) + 1
+		fmt.Printf("  (%dm)\n", m)
+	case Active:
+		fmt.Println("")
+	}
+	s.mu.RUnlock()
+}
 
 func main() {
 	log.SetLevel(log.DebugLevel)
@@ -39,55 +136,64 @@ func main() {
 	c := make(chan notify.EventInfo, 5)
 	notify.Watch(p, c, notify.Write|notify.Remove)
 
+	currentState := state{
+		mu:    &sync.RWMutex{},
+		State: Initial,
+	}
+	currentState.Activate()
+
 	f, err := os.Open(p)
 	if err != nil {
-		log.Fatal("could not open pipe for reading: ", err)
+		log.Fatal("Could not open pipe for reading: ", err)
 	}
 	defer f.Close()
 
 	var e notify.EventInfo
-	var tChan <-chan time.Time
 	for {
 		select {
 		case e = <-c:
-			tChan = handle(e.Event(), f)
-		case <-tChan:
-			log.Debug("Shit expired")
-			resumeNotifications()
-		}
-	}
-}
-
-func handle(e notify.Event, r io.Reader) <-chan time.Time {
-	switch e {
-	case notify.Write:
-		log.Debug("Write event. Read full pipe")
-		s := bufio.NewScanner(r)
-		for s.Scan() {
-			switch s.Text() {
-			case "pause":
-				go pauseNotifications()
-				return time.NewTimer(time.Second * 10).C
-			case "resume":
-				go resumeNotifications()
+			switch e.Event() {
+			case notify.Write:
+				log.Debugf("Pipe event: %v", e.Event().String())
+				s := bufio.NewScanner(f)
+				for s.Scan() {
+					switch s.Text() {
+					case "pause":
+						currentState.Pause(time.Hour)
+					case "resume":
+						currentState.Activate()
+					default:
+						log.Debugf("Unrecognized command: %v", s.Text())
+					}
+				}
+			case notify.Remove:
+				log.Fatalf("Pipe was removed. Exiting.")
 			}
 		}
-	case notify.Remove:
-		log.Fatalf("Pipe was removed. Exiting.")
 	}
-
-	return nil
 }
 
-func resumeNotifications() {
+func resumeNotifications(quiet bool) {
 	notification.NewNotification(Resume, "").Show()
-	notification.NewNotification("Notifications resumed", "").Show()
+	if !quiet {
+		notification.Notification{
+			AppIcon: "appointment-soon",
+			Summary: "Notifications resumed",
+			Timeout: notification.ExpiresDefault,
+		}.Show()
+	}
 }
 
 func pauseNotifications() {
-	id, err := notification.NewNotification("Pause notifications...", "Notifications will be paused for an hour...").Show()
+	id, err := notification.Notification{
+		AppIcon: "appointment-missed",
+		Summary: "Pause notifications...",
+		Body:    "Notifications will be paused for an hour...",
+		Timeout: notification.ExpiresDefault,
+	}.Show()
+
 	if err == nil {
-		<-time.After(3 * time.Second)
+		<-time.After(5 * time.Second)
 		notification.CloseNotification(id)
 	}
 	notification.NewNotification(Pause, "").Show()
