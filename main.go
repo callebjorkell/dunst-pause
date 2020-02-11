@@ -21,6 +21,7 @@ const (
 )
 
 var PauseResolution = 10 * time.Second
+var DefaultExpiry = time.Hour
 
 type Status int
 
@@ -57,6 +58,19 @@ func (s *state) Pause(expiry time.Duration) {
 	go s.handleTimeout(s.closer, expiry)
 
 	s.mu.Unlock()
+}
+
+func (s *state) Toggle() {
+	s.mu.RLock()
+	switch s.State {
+	case Paused:
+		defer s.Activate()
+	case Active:
+		fallthrough
+	case Initial:
+		defer s.Pause(DefaultExpiry)
+	}
+	s.mu.RUnlock()
 }
 
 func (s *state) Activate() {
@@ -162,6 +176,8 @@ func main() {
 						currentState.Pause(time.Hour)
 					case "resume":
 						currentState.Activate()
+					case "toggle":
+						currentState.Toggle()
 					default:
 						log.Debugf("Unrecognized command: %v", s.Text())
 					}
